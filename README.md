@@ -28,6 +28,10 @@ Matches the example code in the C version of the linenoise library.
 
 Implements a heirarchical command line interface using cli.py and the linenoise library.
 
+### example_non_blocking.py
+
+Shows how the non-blocking API can be used.
+
 ## Motiviation
 
 The GNU readline library is a standard package in Python, but sometimes it's hard to use:

@@ -20,6 +20,7 @@ import struct
 import fcntl
 import string
 import logging
+import enum
 
 # -----------------------------------------------------------------------------
 # logging
@@ -95,6 +96,16 @@ def would_block(fd, timeout):
 
 # Use this value if we can't work out how many columns the terminal has.
 _DEFAULT_COLS = 80
+
+
+class EditResult(enum.Enum):
+    """Result codes for a few edit functions"""
+
+    EOF_OR_ERROR = -1
+    MORE = 0
+    ENTER = 1
+    HOTKEY = 2
+    ESCAPE = 3
 
 
 def get_cursor_position(ifd, ofd):
@@ -222,7 +233,7 @@ class line_state:
             seq.append("\033[0m")
         return seq
 
-    def refresh_singleline(self):
+    def refresh_singleline(self, *, clear, write):
         """single line refresh"""
         seq = []
         plen = len(self.prompt)
@@ -236,73 +247,77 @@ class line_state:
             pos -= 1
         while (plen + blen) > self.cols:
             blen -= 1
-        # cursor to the left edge
-        seq.append("\r")
-        # write the prompt
-        seq.append(self.prompt)
-        # write the current buffer content
-        seq.append("".join([self.buf[i] for i in range(idx, idx + blen)]))
-        # Show hints (if any)
-        seq.extend(self.refresh_show_hints())
-        # Erase to right
-        seq.append("\x1b[0K")
-        # Move cursor to original position
-        seq.append("\r\x1b[%dC" % (plen + pos))
+        if clear:
+            # cursor to the left edge
+            seq.append("\r")
+        if write:
+            # write the prompt
+            seq.append(self.prompt)
+            # write the current buffer content
+            seq.append("".join([self.buf[i] for i in range(idx, idx + blen)]))
+            # Show hints (if any)
+            seq.extend(self.refresh_show_hints())
+        if clear:
+            # Erase to right
+            seq.append("\x1b[0K")
+        if write:
+            # Move cursor to original position
+            seq.append("\r\x1b[%dC" % (plen + pos))
         # write it out
         _puts(self.ofd, "".join(seq))
 
-    def refresh_multiline(self):
+    def refresh_multiline(self, *, clear, write):
         """multiline refresh"""
         plen = len(self.prompt)
-        old_rows = self.maxrows
         # cursor position relative to row
         rpos = (plen + self.oldpos + self.cols) // self.cols
         # rows used by current buf
         rows = (plen + len(self.buf) + self.cols - 1) // self.cols
-        # Update maxrows if needed
-        if rows > self.maxrows:
-            self.maxrows = rows
         seq = []
-        # First step: clear all the lines used before. To do so start by going to the last row.
-        if old_rows - rpos > 0:
-            logging.debug("go down %d" % (old_rows - rpos))
-            seq.append("\x1b[%dB" % (old_rows - rpos))
-        # Now for every row clear it, go up.
-        for j in range(old_rows - 1):
-            logging.debug("clear+up")
-            seq.append("\r\x1b[0K\x1b[1A")
-        # Clear the top line.
-        logging.debug("clear")
-        seq.append("\r\x1b[0K")
-        # Write the prompt and the current buffer content
-        seq.append(self.prompt)
-        seq.append(str(self))
-        # Show hints (if any)
-        seq.extend(self.refresh_show_hints())
-        # If we are at the very end of the screen with our cursor, we need to
-        # emit a newline and move the cursor to the first column.
-        if self.pos and self.pos == len(self.buf) and (self.pos + plen) % self.cols == 0:
-            logging.debug("<newline>")
-            seq.append("\n\r")
-            rows += 1
-            if rows > self.maxrows:
-                self.maxrows = rows
-        # Move cursor to right position.
-        rpos2 = (plen + self.pos + self.cols) // self.cols  # current cursor relative row.
-        logging.debug("rpos2 %d" % rpos2)
-        # Go up till we reach the expected position.
-        if rows - rpos2 > 0:
-            logging.debug("go-up %d" % (rows - rpos2))
-            seq.append("\x1b[%dA" % (rows - rpos2))
-        # Set column
-        col = (plen + self.pos) % self.cols
-        logging.debug("set col %d" % (1 + col))
-        if col:
-            seq.append("\r\x1b[%dC" % col)
-        else:
-            seq.append("\r")
-        # save the cursor position
+        if clear:
+            # First step: clear all the lines used before. To do so start by going to the last row.
+            old_rows = self.maxrows
+            if old_rows - rpos > 0:
+                logging.debug("go down %d" % (old_rows - rpos))
+                seq.append("\x1b[%dB" % (old_rows - rpos))
+            # Now for every row clear it, go up.
+            for _ in range(old_rows - 1):
+                logging.debug("clear+up")
+                seq.append("\r\x1b[0K\x1b[1A")
+            # Clear the top line.
+            logging.debug("clear")
+            seq.append("\r\x1b[0K")
+        if write:
+            # Write the prompt and the current buffer content
+            seq.append(self.prompt)
+            seq.append(str(self))
+            self.maxrows = rows
+            # Show hints (if any)
+            seq.extend(self.refresh_show_hints())
+            # If we are at the very end of the screen with our cursor, we need to
+            # emit a newline and move the cursor to the first column.
+            if self.pos and self.pos == len(self.buf) and (self.pos + plen) % self.cols == 0:
+                logging.debug("<newline>")
+                seq.append("\n\r")
+                rows += 1
+                if rows > self.maxrows:
+                    self.maxrows = rows
+            # Move cursor to right position.
+            rpos2 = (plen + self.pos + self.cols) // self.cols  # current cursor relative row.
+            logging.debug("rpos2 %d" % rpos2)
+            # Go up till we reach the expected position.
+            if rows - rpos2 > 0:
+                logging.debug("go-up %d" % (rows - rpos2))
+                seq.append("\x1b[%dA" % (rows - rpos2))
+            # Set column
+            col = (plen + self.pos) % self.cols
+            logging.debug("set col %d" % (1 + col))
+            if col:
+                seq.append("\r\x1b[%dC" % col)
+            else:
+                seq.append("\r")
         logging.debug("\n")
+        # save the cursor position
         self.oldpos = self.pos
         # write it out
         _puts(self.ofd, "".join(seq))
@@ -310,9 +325,28 @@ class line_state:
     def refresh_line(self):
         """refresh the edit line"""
         if self.ts.mlmode:
-            self.refresh_multiline()
+            self.refresh_multiline(clear=True, write=True)
         else:
-            self.refresh_singleline()
+            self.refresh_singleline(clear=True, write=True)
+
+    def hide(self):
+        """hide the edit line"""
+        if self.ts.mlmode:
+            self.refresh_multiline(clear=True, write=False)
+        else:
+            self.refresh_singleline(clear=True, write=False)
+        self.ts.disable_rawmode(self.ifd)
+
+    def show(self):
+        """show the edit line"""
+        res = self.ts.enable_rawmode(self.ifd)
+        if res != 0:
+            return res
+        if self.ts.mlmode:
+            self.refresh_multiline(clear=False, write=True)
+        else:
+            self.refresh_singleline(clear=False, write=True)
+        return 0
 
     def edit_delete(self):
         """delete the character at the current cursor position"""
@@ -529,31 +563,48 @@ class linenoise:
         sys.stdout.flush()
         self.disable_rawmode(_STDIN)
 
-    def edit(self, ifd, ofd, prompt, s):
+    def edit_start(self, prompt, s="", ifd=_STDIN, ofd=_STDOUT):
         """
-        edit a line in raw mode
-        ifd = input fiel descriptor
-        ofd = output file descriptor
-        prompt = line prompt string
-        s = initial line string
+        Initiate a non-blocking read operation.
+        Call `edit_feed()` whenever data is available on file descriptor `ifd`.
+        Call `edit_stop()` to stop the read operation.
+        Returns a `line_state` object on success and `None` on error.
         """
+        if self.enable_rawmode(ifd) != 0:
+            return None
         # create the line state
         ls = line_state(ifd, ofd, prompt, self)
         # set and output the initial line
         ls.edit_set(s)
         # The latest history entry is always our current buffer
         self.history_add(str(ls))
-        while True:
+        return ls
+
+    def edit_feed(self, ls):
+        """
+        Process input data during a non-blocking read operation.
+        This function should be called whenever data is available on the file
+        descriptor `ls.ifd`.
+        The function `edit_start()` should be called before this in order to
+        initiate a non-blocking read operation.
+        Returns the result of the operation as an `EditResult` enum.
+        If `EditResult.MORE` is returned, this function should be called again
+        whenever there is data available.
+        If anything else is returned, the function `edit_stop()` should be
+        called.
+        """
+        if ls:
+            ifd = ls.ifd
             c = _getc(ifd)
             if c == _KEY_NULL:
                 # error on read
-                return str(ls)
+                return EditResult.EOF_OR_ERROR
             # Autocomplete when the callback is set.
             # It returns the character that should be handled next.
             if c == _KEY_TAB and self.completion_callback is not None:
                 c = ls.complete_line()
                 if c == _KEY_NULL:
-                    continue
+                    return EditResult.MORE
             # handle the key code
             if c == _KEY_ENTER or c == self.hotkey:
                 self.history.pop()
@@ -564,7 +615,7 @@ class linenoise:
                     self.hints_callback = None
                     ls.refresh_line()
                     self.hints_callback = hcb
-                return str(ls) + ("", self.hotkey)[c == self.hotkey]
+                return EditResult.ENTER if c == _KEY_ENTER else EditResult.HOTKEY
             elif c == _KEY_BS:
                 # backspace: remove the character to the left of the cursor
                 ls.edit_backspace()
@@ -572,7 +623,7 @@ class linenoise:
                 if would_block(ifd, _CHAR_TIMEOUT):
                     # looks like a single escape- abandon the line
                     self.history.pop()
-                    return ""
+                    return EditResult.ESCAPE
                 # escape sequence
                 s0 = _getc(ifd, _CHAR_TIMEOUT)
                 s1 = _getc(ifd, _CHAR_TIMEOUT)
@@ -621,8 +672,7 @@ class linenoise:
                 # cursor left
                 ls.edit_move_left()
             elif c == _KEY_CTRL_C:
-                # return None == EOF
-                return None
+                return EditResult.EOF_OR_ERROR
             elif c == _KEY_CTRL_D:
                 # delete: remove the character to the right of the cursor.
                 # If the line is empty act as an EOF.
@@ -630,7 +680,7 @@ class linenoise:
                     ls.edit_delete()
                 else:
                     self.history.pop()
-                    return None
+                    return EditResult.EOF_OR_ERROR
             elif c == _KEY_CTRL_E:
                 # go to the end of the line
                 ls.edit_move_end()
@@ -665,15 +715,52 @@ class linenoise:
             else:
                 # insert the character into the line buffer
                 ls.edit_insert(c)
+            return EditResult.MORE
+        else:
+            return EditResult.EOF_OR_ERROR
+
+    def edit_stop(self, ls):
+        """
+        Stops a non-blocking read operation.
+        This function should always be called (at some point) after a call to
+        `edit_start()` has been made.
+        Note that it is also possible to temporarily hide and show the command
+        line using the functions `ls.hide()` and `ls.show()`.
+        """
+        self.disable_rawmode(ls.ifd)
+        sys.stdout.write("\r\n")
+
+    def edit_blocking(self, prompt, s, ifd, ofd):
+        """
+        Perform a blocking read.
+        This function can only be used if the file descriptor `ifd` is a
+        supported tty.
+        The function `read()` can be used instead to get a fallback for
+        unsupported ttys.
+        Returns the result (see `EditResult`) as well as the command line
+        state (see `line_state`, `None` on error).
+        """
+        ls = self.edit_start(prompt, s, ifd, ofd)
+        if not ls:
+            return EditResult.EOF_OR_ERROR, None
+        while (res := self.edit_feed(ls)) == EditResult.MORE:
+            pass
+        self.edit_stop(ls)
+        return res, ls
 
     def read_raw(self, prompt, s):
         """read a line from stdin in raw mode"""
-        if self.enable_rawmode(_STDIN) == -1:
+        res, ls = self.edit_blocking(prompt, s, _STDIN, _STDOUT)
+        if res == EditResult.ENTER:
+            return str(ls)
+        elif res == EditResult.HOTKEY:
+            return str(ls) + (self.hotkey if self.hotkey else "")
+        elif res == EditResult.ESCAPE:
+            return ""
+        elif res == EditResult.EOF_OR_ERROR:
             return None
-        s = self.edit(_STDIN, _STDOUT, prompt, s)
-        self.disable_rawmode(_STDIN)
-        sys.stdout.write("\r\n")
-        return s
+        else:
+            raise ValueError(res)
 
     def read(self, prompt, s=""):
         """Read a line. Return None on EOF"""
